@@ -1,0 +1,9 @@
+# Core dependencies
+anthropic>=0.40.0       # Claude API client
+requests>=2.31.0        # HTTP client for EDGAR API
+python-dotenv>=1.0.0    # Load .env file
+
+# Development / testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+responses>=0.24.0       # Mock HTTP calls in tests
