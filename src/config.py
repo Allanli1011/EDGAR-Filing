@@ -107,11 +107,21 @@ class MonitorConfig:
                 "Add it to your .env file, or set LLM_BACKEND=openclaw to use OpenClaw."
             )
         if backend == "openclaw" and not self.openclaw_model_id:
-            raise ValueError(
-                "OPENCLAW_MODEL_ID is not set. "
-                "Set it to the model 'id' from your openclaw.json, "
-                "e.g. OPENCLAW_MODEL_ID=hf:zai-org/GLM-4.7"
-            )
+            # Allow omitting OPENCLAW_MODEL_ID if a global default is configured
+            # in agents.defaults.model.primary within openclaw.json.
+            try:
+                from .openclaw_config import get_default_model_id
+                if not get_default_model_id():
+                    raise ValueError(
+                        "OPENCLAW_MODEL_ID is not set and no agents.defaults.model.primary "
+                        "is configured in openclaw.json. "
+                        "Set OPENCLAW_MODEL_ID in .env, e.g. OPENCLAW_MODEL_ID=hf:zai-org/GLM-4.7"
+                    )
+            except FileNotFoundError:
+                raise ValueError(
+                    "OPENCLAW_MODEL_ID is not set and openclaw.json was not found. "
+                    "Set OPENCLAW_MODEL_ID in .env, e.g. OPENCLAW_MODEL_ID=hf:zai-org/GLM-4.7"
+                )
         if not self.edgar_user_agent or "example.com" in self.edgar_user_agent:
             import warnings
             warnings.warn(

@@ -18,6 +18,14 @@ openclaw.json structure (JSON5 — comments and trailing commas allowed):
         ]
       }
     }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "<provider_name>/<model_id>",  // global default model
+        "fallbacks": [...]
+      }
+    }
   }
 }
 
@@ -144,6 +152,31 @@ def list_available_models(config_path: Optional[Path] = None) -> list[dict]:
                 "base_url": provider_cfg.get("baseUrl", ""),
             })
     return result
+
+
+def get_default_model_id(config_path: Optional[Path] = None) -> Optional[str]:
+    """
+    Return the global default model ID from agents.defaults.model.primary.
+
+    The value may be a bare model ID (e.g. "qwen2.5:72b") or use the
+    "provider_name/model_id" shorthand (e.g. "anthropic/claude-sonnet-4-6").
+
+    Returns None if the field is not set in openclaw.json.
+    """
+    path = config_path or default_config_path()
+    try:
+        raw = _read_json5(path)
+    except FileNotFoundError:
+        return None
+    primary = (
+        raw.get("agents", {})
+        .get("defaults", {})
+        .get("model", {})
+        .get("primary")
+    )
+    if not primary or not isinstance(primary, str):
+        return None
+    return primary.strip()
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────

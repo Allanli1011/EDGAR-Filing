@@ -10,6 +10,7 @@ from src.openclaw_config import (
     OpenClawModelConfig,
     load_model_config,
     list_available_models,
+    get_default_model_id,
     _read_json5,
     _strip_json5_comments,
 )
@@ -220,3 +221,52 @@ class TestJson5Parsing:
         text = '{"url": "http://localhost:8000/v1"}'
         result = _strip_json5_comments(text)
         assert "http://localhost:8000/v1" in result
+
+
+# ── Tests: get_default_model_id ───────────────────────────────────────────────
+
+class TestGetDefaultModelId:
+    def test_returns_primary_model(self, tmp_path):
+        config = {
+            "models": {"providers": {}},
+            "agents": {
+                "defaults": {
+                    "model": {
+                        "primary": "qwen2.5:72b",
+                        "fallbacks": ["llama3.3:70b"],
+                    }
+                }
+            },
+        }
+        p = tmp_path / "openclaw.json"
+        p.write_text(json.dumps(config))
+        assert get_default_model_id(config_path=p) == "qwen2.5:72b"
+
+    def test_returns_provider_slash_model_format(self, tmp_path):
+        config = {
+            "agents": {"defaults": {"model": {"primary": "anthropic/claude-sonnet-4-6"}}}
+        }
+        p = tmp_path / "openclaw.json"
+        p.write_text(json.dumps(config))
+        assert get_default_model_id(config_path=p) == "anthropic/claude-sonnet-4-6"
+
+    def test_returns_none_when_agents_section_missing(self, tmp_path):
+        config = {"models": {"providers": {}}}
+        p = tmp_path / "openclaw.json"
+        p.write_text(json.dumps(config))
+        assert get_default_model_id(config_path=p) is None
+
+    def test_returns_none_when_primary_missing(self, tmp_path):
+        config = {"agents": {"defaults": {"model": {}}}}
+        p = tmp_path / "openclaw.json"
+        p.write_text(json.dumps(config))
+        assert get_default_model_id(config_path=p) is None
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        assert get_default_model_id(config_path=tmp_path / "missing.json") is None
+
+    def test_strips_whitespace_from_primary(self, tmp_path):
+        config = {"agents": {"defaults": {"model": {"primary": "  my-model  "}}}}
+        p = tmp_path / "openclaw.json"
+        p.write_text(json.dumps(config))
+        assert get_default_model_id(config_path=p) == "my-model"

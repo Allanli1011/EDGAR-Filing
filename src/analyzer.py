@@ -221,14 +221,18 @@ class _OpenClawBackend(_LLMBackend):
     """
 
     def __init__(self, model_id: Optional[str] = None):
-        from .openclaw_config import load_model_config, default_config_path
+        from .openclaw_config import load_model_config, get_default_model_id
 
         self._model_id = model_id or os.environ.get("OPENCLAW_MODEL_ID", "")
         if not self._model_id:
+            # Fall back to agents.defaults.model.primary from openclaw.json
+            self._model_id = get_default_model_id() or ""
+            if self._model_id:
+                logger.info("Using OpenClaw global default model: %s", self._model_id)
+        if not self._model_id:
             raise ValueError(
-                "OPENCLAW_MODEL_ID is not set. "
-                "Set it in .env to the model 'id' from your openclaw.json, "
-                "e.g. OPENCLAW_MODEL_ID=hf:zai-org/GLM-4.7"
+                "No model selected. Set OPENCLAW_MODEL_ID in .env, "
+                "or configure agents.defaults.model.primary in openclaw.json."
             )
 
         cfg = load_model_config(self._model_id)
