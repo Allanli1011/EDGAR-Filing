@@ -30,13 +30,15 @@ EDGAR-Filing/
 │   ├── config.py              # MonitorConfig (reads from env vars)
 │   ├── models.py              # Filing, AnalysisResult dataclasses
 │   ├── collector.py           # EDGARCollector — fetches filings via EFTS API
-│   ├── analyzer.py            # FilingAnalyzer — Claude-powered analysis
+│   ├── analyzer.py            # FilingAnalyzer — multi-backend LLM analysis
+│   ├── openclaw_config.py     # OpenClaw config reader (openclaw.json parser)
 │   ├── monitor.py             # DailyMonitor — orchestrates the pipeline
 │   └── storage.py             # ResultStorage — saves JSON + CSV output
 ├── tests/
 │   ├── test_collector.py
 │   ├── test_analyzer.py
-│   └── test_models.py
+│   ├── test_models.py
+│   └── test_openclaw_config.py
 └── output/                    # Daily results (gitignored)
     └── edgar_analysis_YYYY-MM-DD.{json,csv}
 ```
@@ -48,8 +50,10 @@ EDGAR-Filing/
 ### Prerequisites
 
 - **Python 3.11+**
-- An **Anthropic API key** (from https://console.anthropic.com)
 - A valid **SEC EDGAR User-Agent** string (required by SEC policy)
+- **One of the following LLM backends:**
+  - **Anthropic API key** (from https://console.anthropic.com) — for `LLM_BACKEND=claude` (default)
+  - **OpenClaw** configured with at least one provider — for `LLM_BACKEND=openclaw`
 
 ### Installation
 
@@ -111,12 +115,15 @@ run_monitor.py
     └── DailyMonitor.run()
             ├── EDGARCollector.fetch_recent_filings()   ← EDGAR EFTS API
             │       └── EDGARCollector.fetch_filing_text()
-            ├── FilingAnalyzer.analyze()                ← Claude API (claude-opus-4-6)
+            ├── FilingAnalyzer.analyze()                ← LLM backend (Claude or OpenClaw)
             └── ResultStorage.save_daily_results()      ← JSON + CSV
 ```
 
 - **Collector** throttles requests at ≥110ms per call (SEC 10 req/s limit)
-- **Analyzer** uses `claude-opus-4-6` with adaptive thinking and streaming
+- **Analyzer** supports two backends, selected via `LLM_BACKEND` env var:
+  - `claude` (default) — `claude-opus-4-6` with adaptive thinking and streaming
+  - `openclaw` — reads `~/.openclaw/openclaw.json`, calls provider API directly
+- **OpenClaw config** (`src/openclaw_config.py`) parses JSON5 config, resolves model by ID, supports `openai-completions`, `openai-responses`, and `anthropic-messages` API types
 - Each form type has a specialized analysis prompt in `src/analyzer.py`
 - Results include: summary, investment_signals, risk_factors, sentiment, key_metrics
 
@@ -145,8 +152,14 @@ Claude-generated branches follow the pattern: `claude/<description>-<sessionId>`
 ### Environment Variables
 
 Never commit secrets or credentials. Use a `.env` file (gitignored). Required variables:
-- `ANTHROPIC_API_KEY` — Claude API key (https://console.anthropic.com)
 - `EDGAR_USER_AGENT` — required by SEC (`User-Agent: Your Name your@email.com`)
+- `ANTHROPIC_API_KEY` — Claude API key; required when `LLM_BACKEND=claude` (default)
+
+LLM backend selection:
+- `LLM_BACKEND` — `claude` (default) or `openclaw`
+- `OPENCLAW_MODEL_ID` — model ID from `openclaw.json`; optional when `LLM_BACKEND=openclaw` if `agents.defaults.model.primary` is set in `openclaw.json`
+- `OPENCLAW_CONFIG_PATH` — override path to `openclaw.json` (default: `~/.openclaw/openclaw.json`)
+- `OPENCLAW_STATE_DIR` / `OPENCLAW_HOME` — override openclaw home directory
 
 See `.env.example` for the full list of optional configuration variables.
 
@@ -196,8 +209,8 @@ pytest tests/ -v --cov=src --cov-report=term-missing
 
 - Tests live in `tests/`, mirroring `src/` structure
 - HTTP calls to EDGAR are mocked with the `responses` library — never hit live EDGAR in CI
-- Claude API calls are mocked with `unittest.mock.patch`
-- 34 tests covering collector, analyzer, and models
+- Claude and OpenAI API calls are mocked with `unittest.mock.patch`
+- `test_openclaw_config.py` uses `tmp_path` fixtures — no real `openclaw.json` needed
 
 ---
 
@@ -208,6 +221,20 @@ pytest tests/ -v --cov=src --cov-report=term-missing
 ```bash
 python run_monitor.py --date 2024-12-01
 ```
+
+### Switch to OpenClaw Backend
+
+```bash
+# In .env, set:
+LLM_BACKEND=openclaw
+# Optionally set a specific model (if not set, agents.defaults.model.primary is used):
+# OPENCLAW_MODEL_ID=qwen2.5:72b
+
+# List all models available in your openclaw.json:
+python -c "from src.openclaw_config import list_available_models; [print(m['provider'], m['id']) for m in list_available_models()]"
+```
+
+OpenClaw reads `~/.openclaw/openclaw.json` directly — no separate API key or URL config needed. API credentials are resolved from the provider's `apiKey` field or `~/.openclaw/credentials/<provider_name>`.
 
 ### Add a New Form Type
 
