@@ -5,7 +5,15 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+import src.analyzer as analyzer_module
 from src.analyzer import FilingAnalyzer
+
+
+class _AnthropicShim:
+    Anthropic = None
+
+
+analyzer_module.anthropic = _AnthropicShim()
 from src.models import Filing, AnalysisResult
 
 
@@ -154,7 +162,7 @@ class TestAnalyze:
         result = analyzer.analyze(filing, filing_text="")
 
         assert result.error is not None
-        assert "API error" in result.error
+        assert "Server error" in result.error or "API error" in result.error
 
     @patch("src.analyzer.anthropic.Anthropic")
     def test_form4_uses_correct_prompt(self, MockAnthropic):

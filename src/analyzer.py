@@ -15,8 +15,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
-import anthropic
-import openai
+anthropic = None
+openai = None
 
 from .models import Filing, AnalysisResult
 
@@ -184,6 +184,11 @@ class _ClaudeBackend(_LLMBackend):
     MODEL = "claude-opus-4-6"
 
     def __init__(self, api_key: Optional[str] = None):
+        global anthropic
+        if anthropic is None:
+            import anthropic as anthropic_module
+            anthropic = anthropic_module
+        self._anthropic = anthropic
         self._client = anthropic.Anthropic(api_key=api_key)
 
     def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, int]:
@@ -229,6 +234,12 @@ class _OpenClawBackend(_LLMBackend):
             self._model_id = get_default_model_id() or ""
             if self._model_id:
                 logger.info("Using OpenClaw global default model: %s", self._model_id)
+
+        # Accept provider/model shorthand from openclaw.json default model config.
+        # load_model_config expects the raw model id field, e.g. "gpt-5.4" rather
+        # than "bobdong-gpt/gpt-5.4".
+        if "/" in self._model_id:
+            self._model_id = self._model_id.split("/", 1)[1]
         if not self._model_id:
             raise ValueError(
                 "No model selected. Set OPENCLAW_MODEL_ID in .env, "
@@ -246,10 +257,20 @@ class _OpenClawBackend(_LLMBackend):
 
         # Build the right SDK client based on the provider's api type
         if cfg.api_type == "anthropic-messages":
+            global anthropic
+            if anthropic is None:
+                import anthropic as anthropic_module
+                anthropic = anthropic_module
+            self._anthropic = anthropic
             self._call = self._call_anthropic
             self._anthropic_client = anthropic.Anthropic(api_key=cfg.api_key)
         else:
             # openai-completions or openai-responses both use the OpenAI SDK
+            global openai
+            if openai is None:
+                import openai as openai_module
+                openai = openai_module
+            self._openai = openai
             self._call = self._call_openai
             self._openai_client = openai.OpenAI(
                 api_key=cfg.api_key or "openclaw",
@@ -370,19 +391,26 @@ class FilingAnalyzer:
                 user=user_message,
                 max_tokens=max_tokens,
             )
-        except anthropic.RateLimitError as exc:
-            logger.error("Rate limit hit: %s", exc)
-            return self._error_result(filing, f"Rate limit: {exc}")
-        except anthropic.APIError as exc:
-            logger.error("Anthropic API error: %s", exc)
-            return self._error_result(filing, f"API error: {exc}")
-        except openai.RateLimitError as exc:
-            logger.error("OpenClaw rate limit hit: %s", exc)
-            return self._error_result(filing, f"Rate limit: {exc}")
-        except openai.APIError as exc:
-            logger.error("OpenClaw API error: %s", exc)
-            return self._error_result(filing, f"OpenClaw API error: {exc}")
         except Exception as exc:
+            anthropic_mod = getattr(self._backend, "_anthropic", None)
+            openai_mod = getattr(self._backend, "_openai", None)
+            anthropic_rate_limit = getattr(anthropic_mod, "RateLimitError", None)
+            anthropic_api_error = getattr(anthropic_mod, "APIError", None)
+            openai_rate_limit = getattr(openai_mod, "RateLimitError", None)
+            openai_api_error = getattr(openai_mod, "APIError", None)
+
+            if anthropic_rate_limit and isinstance(exc, anthropic_rate_limit):
+                logger.error("Rate limit hit: %s", exc)
+                return self._error_result(filing, f"Rate limit: {exc}")
+            if anthropic_api_error and isinstance(exc, anthropic_api_error):
+                logger.error("Anthropic API error: %s", exc)
+                return self._error_result(filing, f"API error: {exc}")
+            if openai_rate_limit and isinstance(exc, openai_rate_limit):
+                logger.error("OpenClaw rate limit hit: %s", exc)
+                return self._error_result(filing, f"Rate limit: {exc}")
+            if openai_api_error and isinstance(exc, openai_api_error):
+                logger.error("OpenClaw API error: %s", exc)
+                return self._error_result(filing, f"OpenClaw API error: {exc}")
             logger.error("Unexpected error: %s", exc, exc_info=True)
             return self._error_result(filing, str(exc))
 
