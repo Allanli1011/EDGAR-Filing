@@ -36,7 +36,11 @@ class DailyMonitor:
     def __init__(self, config: MonitorConfig):
         self.config = config
         self.collector = EDGARCollector(user_agent=config.edgar_user_agent)
-        self.analyzer = FilingAnalyzer(api_key=config.anthropic_api_key)
+        self.analyzer = FilingAnalyzer(
+            api_key=config.anthropic_api_key,
+            openclaw_model_id=config.openclaw_model_id,
+            backend=config.llm_backend,
+        )
         self.storage = ResultStorage(output_dir=config.output_dir)
 
     def run(

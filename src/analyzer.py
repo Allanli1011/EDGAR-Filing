@@ -1,21 +1,29 @@
 """
-Filing Analyzer — uses Claude to extract investment-relevant insights
-from SEC EDGAR filings.
+Filing Analyzer — extracts investment-relevant insights from SEC EDGAR filings.
 
-Uses claude-opus-4-6 with adaptive thinking and streaming for long documents.
+Supports two LLM backends, switchable via LLM_BACKEND env var:
+  - "claude"   (default) : Anthropic Claude API (claude-opus-4-6, adaptive thinking)
+  - "openclaw"           : OpenClaw gateway — OpenAI-compatible API at port 18789,
+                           routes to whichever model is configured in openclaw.json
+
+Set LLM_BACKEND=openclaw in your .env to use OpenClaw.
 """
 
 import json
 import logging
+import os
+from abc import ABC, abstractmethod
 from typing import Optional
 
 import anthropic
+import openai
 
 from .models import Filing, AnalysisResult
 
 logger = logging.getLogger(__name__)
 
-# System prompt shared across all form types
+# ── Shared prompts (backend-agnostic) ─────────────────────────────────────────
+
 _SYSTEM_PROMPT = """You are an expert securities analyst specializing in SEC EDGAR filings.
 Your task is to analyze filings and extract actionable investment insights for US stock investors.
 
@@ -23,7 +31,6 @@ Always respond with valid JSON matching the schema provided in the user message.
 Be concise, factual, and focus on material information that could affect stock price or investment thesis.
 Never fabricate data — if information is not present in the filing, omit it."""
 
-# Per-form-type analysis instructions
 _FORM_PROMPTS: dict[str, str] = {
     "4": """Analyze this Form 4 (insider transaction) filing.
 
@@ -139,7 +146,6 @@ Similar to NT 10-K but quarterly. Focus on the stated reason for delay and
 any indication of restatement or going-concern issues.""",
 }
 
-# JSON output schema for all analyses
 _OUTPUT_SCHEMA = """{
     "summary": "2-3 sentence plain-English summary of the filing",
     "investment_signals": ["bullish/bearish signal 1", "signal 2", ...],
@@ -154,11 +160,186 @@ _OUTPUT_SCHEMA = """{
 }"""
 
 
-class FilingAnalyzer:
-    """Analyzes SEC filings using Claude API."""
+# ── Backend abstraction ────────────────────────────────────────────────────────
+
+class _LLMBackend(ABC):
+    """Abstract base for LLM inference backends."""
+
+    @abstractmethod
+    def complete(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int,
+    ) -> tuple[str, int]:
+        """
+        Call the LLM and return (response_text, total_tokens_used).
+        Raises on unrecoverable errors; callers handle retries/logging.
+        """
+
+
+class _ClaudeBackend(_LLMBackend):
+    """Calls Anthropic Claude API with adaptive thinking + streaming."""
+
+    MODEL = "claude-opus-4-6"
 
     def __init__(self, api_key: Optional[str] = None):
-        self.client = anthropic.Anthropic(api_key=api_key)  # uses ANTHROPIC_API_KEY if None
+        self._client = anthropic.Anthropic(api_key=api_key)
+
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, int]:
+        with self._client.messages.stream(
+            model=self.MODEL,
+            max_tokens=max_tokens,
+            thinking={"type": "adaptive"},
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        ) as stream:
+            response = stream.get_final_message()
+
+        text = next(
+            (b.text for b in response.content if b.type == "text"), ""
+        )
+        tokens = response.usage.input_tokens + response.usage.output_tokens
+        return text, tokens
+
+
+class _OpenClawBackend(_LLMBackend):
+    """
+    Reads a model config from ~/.openclaw/openclaw.json by model ID, then calls
+    that provider's API directly — no separate API key or URL configuration needed.
+
+    The model_id must match the "id" field of one of the models defined in
+    openclaw.json's models.providers section (e.g. "hf:zai-org/GLM-4.7").
+
+    Set OPENCLAW_MODEL_ID in .env to select which model to use.
+    The config file path defaults to ~/.openclaw/openclaw.json (override with
+    OPENCLAW_CONFIG_PATH or OPENCLAW_STATE_DIR).
+
+    Supports all three API types openclaw.json uses:
+      openai-completions / openai-responses  → openai SDK
+      anthropic-messages                     → anthropic SDK
+    """
+
+    def __init__(self, model_id: Optional[str] = None):
+        from .openclaw_config import load_model_config, default_config_path
+
+        self._model_id = model_id or os.environ.get("OPENCLAW_MODEL_ID", "")
+        if not self._model_id:
+            raise ValueError(
+                "OPENCLAW_MODEL_ID is not set. "
+                "Set it in .env to the model 'id' from your openclaw.json, "
+                "e.g. OPENCLAW_MODEL_ID=hf:zai-org/GLM-4.7"
+            )
+
+        cfg = load_model_config(self._model_id)
+        self._cfg = cfg
+        self.model = cfg.model_id
+
+        logger.info(
+            "OpenClaw backend: provider=%s model=%s api_type=%s base_url=%s",
+            cfg.provider_name, cfg.model_id, cfg.api_type, cfg.base_url,
+        )
+
+        # Build the right SDK client based on the provider's api type
+        if cfg.api_type == "anthropic-messages":
+            self._call = self._call_anthropic
+            self._anthropic_client = anthropic.Anthropic(api_key=cfg.api_key)
+        else:
+            # openai-completions or openai-responses both use the OpenAI SDK
+            self._call = self._call_openai
+            self._openai_client = openai.OpenAI(
+                api_key=cfg.api_key or "openclaw",
+                base_url=cfg.base_url,
+            )
+
+    def complete(self, system: str, user: str, max_tokens: int) -> tuple[str, int]:
+        return self._call(system, user, max_tokens)
+
+    def _call_openai(self, system: str, user: str, max_tokens: int) -> tuple[str, int]:
+        response = self._openai_client.chat.completions.create(
+            model=self._cfg.model_id,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        text = response.choices[0].message.content or ""
+        tokens = 0
+        if response.usage:
+            tokens = response.usage.prompt_tokens + response.usage.completion_tokens
+        return text, tokens
+
+    def _call_anthropic(self, system: str, user: str, max_tokens: int) -> tuple[str, int]:
+        """Used when the openclaw provider uses anthropic-messages api type."""
+        client = self._anthropic_client
+        # Point the anthropic client at the provider's base_url
+        # (strip /v1 suffix if present — anthropic SDK adds its own path)
+        base = self._cfg.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        client.base_url = base  # type: ignore[attr-defined]
+
+        with client.messages.stream(
+            model=self._cfg.model_id,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        ) as stream:
+            response = stream.get_final_message()
+
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        tokens = response.usage.input_tokens + response.usage.output_tokens
+        return text, tokens
+
+
+def _build_backend(
+    backend_name: str,
+    anthropic_api_key: Optional[str] = None,
+    openclaw_model_id: Optional[str] = None,
+) -> _LLMBackend:
+    """Factory: returns the right backend based on backend_name."""
+    name = backend_name.lower().strip()
+    if name == "openclaw":
+        return _OpenClawBackend(model_id=openclaw_model_id)
+    if name == "claude":
+        return _ClaudeBackend(api_key=anthropic_api_key)
+    raise ValueError(
+        f"Unknown LLM_BACKEND '{backend_name}'. Valid values: claude, openclaw"
+    )
+
+
+# ── Public analyzer ────────────────────────────────────────────────────────────
+
+class FilingAnalyzer:
+    """
+    Analyzes SEC filings and returns structured investment insights.
+
+    Backend is selected at construction time via the `backend` argument
+    or the LLM_BACKEND environment variable ("claude" | "openclaw").
+    """
+
+    def __init__(
+        self,
+        # Claude backend settings
+        api_key: Optional[str] = None,
+        # OpenClaw backend settings
+        openclaw_model_id: Optional[str] = None,
+        # Backend selector: "claude" | "openclaw" (reads LLM_BACKEND env if None)
+        backend: Optional[str] = None,
+    ):
+        backend_name = backend or os.environ.get("LLM_BACKEND", "claude")
+        self._backend = _build_backend(
+            backend_name,
+            anthropic_api_key=api_key,
+            openclaw_model_id=openclaw_model_id,
+        )
+        self._backend_name = backend_name.lower()
+        logger.info("FilingAnalyzer using backend: %s", self._backend_name)
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
 
     def analyze(
         self,
@@ -166,68 +347,68 @@ class FilingAnalyzer:
         filing_text: str,
         max_tokens: int = 4096,
     ) -> AnalysisResult:
-        """
-        Analyze a filing and return structured investment insights.
-
-        Uses streaming with get_final_message() to handle long responses
-        and avoid HTTP timeouts.
-        """
+        """Analyze a filing and return structured investment insights."""
         form_key = self._normalize_form_key(filing.form_type)
         form_prompt = _FORM_PROMPTS.get(form_key, _FORM_PROMPTS.get("8-K", ""))
-
         user_message = self._build_user_message(filing, filing_text, form_prompt)
 
+        logger.info(
+            "Analyzing %s (%s) for %s [backend=%s]",
+            filing.form_type,
+            filing.accession_no,
+            filing.company_name,
+            self._backend_name,
+        )
+
         try:
-            logger.info(
-                "Analyzing %s (%s) for %s",
-                filing.form_type,
-                filing.accession_no,
-                filing.company_name,
-            )
-
-            with self.client.messages.stream(
-                model="claude-opus-4-6",
-                max_tokens=max_tokens,
-                thinking={"type": "adaptive"},
+            raw_text, tokens_used = self._backend.complete(
                 system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-            ) as stream:
-                response = stream.get_final_message()
-
-            raw_text = ""
-            for block in response.content:
-                if block.type == "text":
-                    raw_text = block.text
-                    break
-
-            parsed = self._parse_response(raw_text)
-            tokens_used = response.usage.input_tokens + response.usage.output_tokens
-
-            return AnalysisResult(
-                filing=filing,
-                summary=parsed.get("summary", ""),
-                investment_signals=parsed.get("investment_signals", []),
-                risk_factors=parsed.get("risk_factors", []),
-                action_items=parsed.get("action_items", []),
-                sentiment=parsed.get("sentiment", "neutral"),
-                confidence=parsed.get("confidence", "medium"),
-                key_metrics=parsed.get("key_metrics", {}),
-                tokens_used=tokens_used,
+                user=user_message,
+                max_tokens=max_tokens,
             )
-
         except anthropic.RateLimitError as exc:
-            logger.error("Rate limit hit analyzing %s: %s", filing.accession_no, exc)
+            logger.error("Rate limit hit: %s", exc)
             return self._error_result(filing, f"Rate limit: {exc}")
         except anthropic.APIError as exc:
-            logger.error("API error analyzing %s: %s", filing.accession_no, exc)
+            logger.error("Anthropic API error: %s", exc)
             return self._error_result(filing, f"API error: {exc}")
+        except openai.RateLimitError as exc:
+            logger.error("OpenClaw rate limit hit: %s", exc)
+            return self._error_result(filing, f"Rate limit: {exc}")
+        except openai.APIError as exc:
+            logger.error("OpenClaw API error: %s", exc)
+            return self._error_result(filing, f"OpenClaw API error: {exc}")
         except Exception as exc:
-            logger.error("Unexpected error analyzing %s: %s", filing.accession_no, exc, exc_info=True)
+            logger.error("Unexpected error: %s", exc, exc_info=True)
             return self._error_result(filing, str(exc))
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        parsed = self._parse_response(raw_text)
+        model_label = (
+            _ClaudeBackend.MODEL
+            if self._backend_name == "claude"
+            else getattr(self._backend, "model", self._backend_name)
+        )
+        logger.info(
+            "  → %s | %s | tokens: %d",
+            parsed.get("sentiment", "?").upper(),
+            (parsed.get("summary") or "")[:80],
+            tokens_used,
+        )
+
+        return AnalysisResult(
+            filing=filing,
+            summary=parsed.get("summary", ""),
+            investment_signals=parsed.get("investment_signals", []),
+            risk_factors=parsed.get("risk_factors", []),
+            action_items=parsed.get("action_items", []),
+            sentiment=parsed.get("sentiment", "neutral"),
+            confidence=parsed.get("confidence", "medium"),
+            key_metrics=parsed.get("key_metrics", {}),
+            tokens_used=tokens_used,
+            model_used=model_label,
+        )
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _build_user_message(
         self, filing: Filing, filing_text: str, form_instructions: str
@@ -259,7 +440,6 @@ class FilingAnalyzer:
         return header + text_section + instructions
 
     def _normalize_form_key(self, form_type: str) -> str:
-        """Map form type variants to a canonical key."""
         mapping = {
             "SC 13D/A": "SC 13D",
             "SC 13G/A": "SC 13G",
@@ -268,19 +448,16 @@ class FilingAnalyzer:
             "10-K/A": "10-K",
             "10-Q/A": "10-Q",
             "4/A": "4",
-            "NT 10-K": "NT 10-K",
-            "NT 10-Q": "NT 10-Q",
         }
         return mapping.get(form_type, form_type)
 
     def _parse_response(self, raw_text: str) -> dict:
-        """Extract JSON from Claude's response text."""
+        """Extract JSON from LLM response text."""
         raw_text = raw_text.strip()
 
-        # Strip markdown code fences if present
+        # Strip markdown code fences
         if raw_text.startswith("```"):
             lines = raw_text.split("\n")
-            # Remove first and last line if they're fences
             if lines[0].startswith("```"):
                 lines = lines[1:]
             if lines and lines[-1].strip() == "```":
@@ -290,7 +467,6 @@ class FilingAnalyzer:
         try:
             return json.loads(raw_text)
         except json.JSONDecodeError:
-            # Try to find JSON object within text
             start = raw_text.find("{")
             end = raw_text.rfind("}") + 1
             if start >= 0 and end > start:

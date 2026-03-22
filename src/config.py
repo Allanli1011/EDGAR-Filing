@@ -60,10 +60,23 @@ class MonitorConfig:
         default_factory=lambda: int(os.environ.get("EDGAR_MAX_PER_FORM", "40"))
     )
 
-    # --- Claude / Anthropic settings ---
+    # --- LLM backend selector ---
+    llm_backend: str = field(
+        default_factory=lambda: os.environ.get("LLM_BACKEND", "claude")
+    )
+
+    # --- Claude / Anthropic settings (used when llm_backend=claude) ---
     anthropic_api_key: str = field(
         default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", "")
     )
+
+    # --- OpenClaw settings (used when llm_backend=openclaw) ---
+    # Model ID must match the "id" field in openclaw.json models.providers
+    openclaw_model_id: str = field(
+        default_factory=lambda: os.environ.get("OPENCLAW_MODEL_ID", "")
+    )
+
+    # --- Analysis tuning ---
     max_analysis_tokens: int = field(
         default_factory=lambda: int(os.environ.get("MAX_ANALYSIS_TOKENS", "4096"))
     )
@@ -87,10 +100,17 @@ class MonitorConfig:
 
     def validate(self) -> None:
         """Raise ValueError if required configuration is missing."""
-        if not self.anthropic_api_key:
+        backend = self.llm_backend.lower()
+        if backend == "claude" and not self.anthropic_api_key:
             raise ValueError(
                 "ANTHROPIC_API_KEY is not set. "
-                "Add it to your .env file or environment."
+                "Add it to your .env file, or set LLM_BACKEND=openclaw to use OpenClaw."
+            )
+        if backend == "openclaw" and not self.openclaw_model_id:
+            raise ValueError(
+                "OPENCLAW_MODEL_ID is not set. "
+                "Set it to the model 'id' from your openclaw.json, "
+                "e.g. OPENCLAW_MODEL_ID=hf:zai-org/GLM-4.7"
             )
         if not self.edgar_user_agent or "example.com" in self.edgar_user_agent:
             import warnings
