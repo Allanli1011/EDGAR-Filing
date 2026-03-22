@@ -158,23 +158,51 @@ class EDGARCollector:
         resp = self._get(url)
         data = resp.json()
 
-        hits = data.get("hits", {}).get("hits", [])
+        if not isinstance(data, dict):
+            logger.error("Expected API response to be dict, got %s: %s", type(data), data)
+            return []
+
+        hits_wrapper = data.get("hits", {})
+        if not isinstance(hits_wrapper, dict):
+            logger.error("Expected 'hits' wrapper to be dict, got %s: %s", type(hits_wrapper), hits_wrapper)
+            return []
+
+        hits = hits_wrapper.get("hits", [])
+        if not isinstance(hits, list):
+            logger.error("Expected 'hits' list to be list, got %s: %s", type(hits), hits)
+            return []
+
         filings: list[Filing] = []
         for hit in hits:
+            if not isinstance(hit, dict):
+                continue
             src = hit.get("_source", {})
-            filing = self._parse_hit(src, form_type)
-            if filing:
-                filings.append(filing)
+            if not isinstance(src, dict):
+                continue
+            
+            # Handle both accession_no (older/mock) and adsh (current live)
+            acc = src.get("accession_no") or src.get("adsh")
+            if acc:
+                filing = self._parse_hit(src, form_type)
+                if filing:
+                    filings.append(filing)
 
         return filings
 
     def _parse_hit(self, src: dict, form_type: str) -> Optional[Filing]:
         """Convert a raw EFTS search hit into a Filing object."""
-        accession_no = src.get("accession_no", "")
+        # accession_no / adsh
+        accession_no = src.get("accession_no") or src.get("adsh", "")
         if not accession_no:
             return None
 
+        # entity_id / ciks
         cik = src.get("entity_id", "")
+        if not cik:
+            ciks = src.get("ciks", [])
+            if isinstance(ciks, list) and ciks:
+                cik = ciks[-1]  # Usually the issuer CIK is last in Form 4s
+
         # entity_id may be bare int; zero-pad to 10 digits
         try:
             cik = str(int(cik)).zfill(10)
@@ -184,13 +212,24 @@ class EDGARCollector:
         company_name = ""
         display_names = src.get("display_names", [])
         if isinstance(display_names, list) and display_names:
-            company_name = display_names[0].get("name", "")
+            first_name = display_names[0]
+            if isinstance(first_name, dict):
+                company_name = first_name.get("name", "")
+            else:
+                company_name = str(first_name)
+            
+            # If it contains "(CIK ...)", clean it up
+            company_name = re.sub(r"\s*\(CIK\s+\d+\)", "", company_name).strip()
+        
         if not company_name:
             company_name = src.get("entity_name", "Unknown")
 
+        # file_date / display_date_filed
         filed_at = src.get("file_date", src.get("display_date_filed", ""))
-        period = src.get("period_of_report", "")
-        actual_form = src.get("form_type", form_type)
+        # period_of_report / period_ending
+        period = src.get("period_of_report", src.get("period_ending", ""))
+        # form_type / form / file_type
+        actual_form = src.get("form_type", src.get("form", src.get("file_type", form_type)))
         items = src.get("items", None)
 
         # Build filing index URL
